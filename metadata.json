@@ -1,0 +1,6 @@
+{
+  "name": "Digital Health Stack",
+  "description": "Privacy-First Digital Healthcare Platform with dynamic patient consent, UHID records, generic OCR lab diagnostics, automated medication reminders, and medical access audit logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
