@@ -8,6 +8,7 @@ import {
   generateUhid
 } from './src/services/storage';
 import { parseLaboratoryReport } from './src/services/ocrParser';
+import { testDatabaseConnection } from './src/database/db';
 import {
   PatientConsent,
   MedicalAccessLog,
@@ -928,6 +929,18 @@ export async function createApp() {
 async function startServer() {
   const app = await createApp();
   const PORT = Number(process.env.PORT) || 3000;
+
+  // PostgreSQL connection test
+  if (process.env.DATABASE_URL) {
+    try {
+      await testDatabaseConnection();
+      console.log('PostgreSQL database connection successful.');
+    } catch (error) {
+      console.error('PostgreSQL database connection failed:', error);
+    }
+  } else {
+    console.log('DATABASE_URL not set; skipping PostgreSQL connection test.');
+  }
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
