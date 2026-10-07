@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     access_granted BOOLEAN NOT NULL DEFAULT FALSE
 );
 
+CREATE TABLE IF NOT EXISTS app_state (
+    id INTEGER PRIMARY KEY,
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_patient_uhid
     ON patient_profiles(uhid);
 
