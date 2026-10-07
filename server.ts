@@ -67,8 +67,13 @@ function logAccess(
 
 export async function createApp() {
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
 
+  // Render health check
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.use(express.json({ limit: '10mb' }));
   // Helper middleware to check authentication
   const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
     const user = getCurrentUser();
