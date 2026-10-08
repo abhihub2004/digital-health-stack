@@ -2,21 +2,17 @@ import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-
 import {
   AppStateData,
   getSeedData,
   generateUhid
 } from './src/services/storage';
-
 import { parseLaboratoryReport } from './src/services/ocrParser';
-
 import {
   testDatabaseConnection,
   loadAppState,
   saveAppState
 } from './src/database/db';
-
 import {
   PatientConsent,
   MedicalAccessLog,
@@ -32,33 +28,136 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// -------------------------------------------------------------
-// APPLICATION STATE
-// -------------------------------------------------------------
-
 let db: AppStateData = getSeedData();
 
-// Current active session identity for simulation
-let currentUserId = 'user_patient_1';
+/* =============================================================
+   REQUEST-SCOPED SESSION MANAGEMENT
+   =============================================================
 
-// -------------------------------------------------------------
-// CURRENT USER
-// -------------------------------------------------------------
+   IMPORTANT:
+   The old server used:
 
-function getCurrentUser(): User | undefined {
-  return db.users.find(u => u.id === currentUserId);
+       let currentUserId = 'user_patient_1';
+
+   That was GLOBAL to the entire Node.js process.
+
+   Therefore:
+   - Patient A could become Patient B
+   - Doctor A could become Doctor B
+   - multiple browsers shared the same identity
+   - new accounts could display the demo account
+
+   This version gives every logged-in client its own session.
+   ============================================================= */
+
+const SESSION_COOKIE = 'dhs_session';
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+
+interface SessionRecord {
+  userId: string;
+  expiresAt: number;
 }
 
-// -------------------------------------------------------------
-// POSTGRESQL STATE PERSISTENCE
-// -------------------------------------------------------------
+const sessionRecords = new Map<string, SessionRecord>();
 
-/**
- * Persist the complete application state to PostgreSQL.
- *
- * When DATABASE_URL is not configured, local development
- * continues using the in-memory application state.
- */
+function createSession(userId: string): string {
+  const token =
+    `${Date.now().toString(36)}-` +
+    `${Math.random().toString(36).slice(2)}-` +
+    `${Math.random().toString(36).slice(2)}`;
+
+  sessionRecords.set(token, {
+    userId,
+    expiresAt: Date.now() + SESSION_TTL_MS
+  });
+
+  return token;
+}
+
+function destroySession(token?: string): void {
+  if (!token) return;
+  sessionRecords.delete(token);
+}
+
+function getSessionToken(req: Request): string | undefined {
+  const cookieHeader = req.headers.cookie || '';
+
+  const cookies = cookieHeader
+    .split(';')
+    .reduce<Record<string, string>>((acc, part) => {
+      const [key, ...valueParts] = part.trim().split('=');
+
+      if (key) {
+        acc[key] = decodeURIComponent(valueParts.join('='));
+      }
+
+      return acc;
+    }, {});
+
+  if (cookies[SESSION_COOKIE]) {
+    return cookies[SESSION_COOKIE];
+  }
+
+  const authorization = req.headers.authorization;
+
+  if (authorization?.startsWith('Bearer ')) {
+    return authorization.slice(7).trim();
+  }
+
+  return undefined;
+}
+
+function getCurrentUser(req: Request): User | undefined {
+  const token = getSessionToken(req);
+
+  if (!token) {
+    return undefined;
+  }
+
+  const session = sessionRecords.get(token);
+
+  if (!session || session.expiresAt <= Date.now()) {
+    destroySession(token);
+    return undefined;
+  }
+
+  return db.users.find(
+    user => user.id === session.userId
+  );
+}
+
+function setSessionCookie(
+  res: Response,
+  token: string
+): void {
+  const secure =
+    process.env.NODE_ENV === 'production'
+      ? '; Secure'
+      : '';
+
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=${encodeURIComponent(
+      token
+    )}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(
+      SESSION_TTL_MS / 1000
+    )}${secure}`
+  );
+}
+
+function clearSessionCookie(
+  res: Response
+): void {
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+  );
+}
+
+/* =============================================================
+   POSTGRESQL STATE PERSISTENCE
+   ============================================================= */
+
 async function persistDbState(): Promise<void> {
   if (!process.env.DATABASE_URL) {
     return;
@@ -66,7 +165,10 @@ async function persistDbState(): Promise<void> {
 
   try {
     await saveAppState(db);
-    console.log('Application state persisted to PostgreSQL.');
+
+    console.log(
+      'Application state persisted to PostgreSQL.'
+    );
   } catch (error) {
     console.error(
       'Failed to persist application state to PostgreSQL:',
@@ -75,9 +177,9 @@ async function persistDbState(): Promise<void> {
   }
 }
 
-// -------------------------------------------------------------
-// AUDIT LOGGING
-// -------------------------------------------------------------
+/* =============================================================
+   AUDIT LOGGING
+   ============================================================= */
 
 function logAccess(
   patientId: string,
@@ -99,16 +201,25 @@ function logAccess(
     : '127.0.0.1';
 
   const newLog: MedicalAccessLog = {
-    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    id:
+      `log_${Date.now()}_${Math.random()
+        .toString(36)
+        .substring(2, 7)}`,
+
     patientId,
     patientUhid,
+
     actorId: actor.id,
     actorName: actor.name,
     actorRole: actor.role,
+
     action,
     resource,
+
     timestamp: new Date().toISOString(),
+
     ipAddress: `${ip}`,
+
     reason,
     consentId,
     accessGranted
@@ -119,16 +230,16 @@ function logAccess(
   return newLog;
 }
 
-// -------------------------------------------------------------
-// CREATE EXPRESS APP
-// -------------------------------------------------------------
+/* =============================================================
+   CREATE EXPRESS APP
+   ============================================================= */
 
 export async function createApp() {
   const app = express();
 
-  // -------------------------------------------------------------
-  // RENDER HEALTH CHECK
-  // -------------------------------------------------------------
+  /* ===========================================================
+     HEALTH CHECK
+     =========================================================== */
 
   app.get('/health', (_req, res) => {
     res.status(200).json({
@@ -136,22 +247,19 @@ export async function createApp() {
     });
   });
 
-  // -------------------------------------------------------------
-  // BODY PARSER
-  // -------------------------------------------------------------
+  /* ===========================================================
+     BODY PARSER
+     =========================================================== */
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(
+    express.json({
+      limit: '10mb'
+    })
+  );
 
-  // -------------------------------------------------------------
-  // AUTOMATIC DATABASE PERSISTENCE
-  // -------------------------------------------------------------
-  //
-  // Any successful non-GET API request that changes application
-  // state will automatically be persisted to PostgreSQL.
-  //
-  // This avoids having to manually add saveAppState() to every
-  // existing mutation endpoint.
-  // -------------------------------------------------------------
+  /* ===========================================================
+     AUTOMATIC DATABASE PERSISTENCE
+     =========================================================== */
 
   app.use((req, res, next) => {
     res.on('finish', () => {
@@ -170,20 +278,21 @@ export async function createApp() {
     next();
   });
 
-  // -------------------------------------------------------------
-  // AUTHENTICATION MIDDLEWARE
-  // -------------------------------------------------------------
+  /* ===========================================================
+     AUTHENTICATION MIDDLEWARE
+     =========================================================== */
 
   const authMiddleware = (
     req: Request,
     res: Response,
     next: NextFunction
   ) => {
-    const user = getCurrentUser();
+    const user = getCurrentUser(req);
 
     if (!user) {
       return res.status(401).json({
-        error: 'Unauthorized. Please sign in.'
+        error:
+          'Unauthorized. Please sign in.'
       });
     }
 
@@ -192,140 +301,393 @@ export async function createApp() {
     next();
   };
 
-  // -------------------------------------------------------------
-  // AUTH & SESSION ENDPOINTS
-  // -------------------------------------------------------------
+  /* ===========================================================
+     AUTH & SESSION ENDPOINTS
+     =========================================================== */
 
-  app.get('/api/auth/current-user', (req, res) => {
-    const user = getCurrentUser();
+  /*
+   * LOGIN
+   *
+   * Supported:
+   * - userId
+   * - email
+   * - UHID
+   * - phone
+   * - doctor license number
+   */
 
-    if (!user) {
-      return res.status(401).json({
-        error: 'Not logged in'
+  app.post(
+    '/api/auth/login',
+    (req, res) => {
+      const {
+        userId,
+        identifier,
+        role
+      } = req.body || {};
+
+      const normalizedIdentifier =
+        typeof identifier === 'string'
+          ? identifier.trim().toLowerCase()
+          : '';
+
+      let user: User | undefined;
+
+      /* -------------------------------------------------------
+         DIRECT USER ID
+         ------------------------------------------------------- */
+
+      if (
+        typeof userId === 'string' &&
+        userId.trim()
+      ) {
+        user = db.users.find(
+          u => u.id === userId.trim()
+        );
+      }
+
+      /* -------------------------------------------------------
+         EMAIL / USER ID
+         ------------------------------------------------------- */
+
+      if (
+        !user &&
+        normalizedIdentifier
+      ) {
+        user = db.users.find(
+          u =>
+            u.id.toLowerCase() ===
+              normalizedIdentifier ||
+            u.email.toLowerCase() ===
+              normalizedIdentifier
+        );
+
+        /* -----------------------------------------------------
+           PATIENT UHID / EMAIL / PHONE
+           ----------------------------------------------------- */
+
+        if (!user) {
+          const patient =
+            db.patients.find(
+              p =>
+                p.uhid.toLowerCase() ===
+                  normalizedIdentifier ||
+                p.email.toLowerCase() ===
+                  normalizedIdentifier ||
+                p.phone.includes(
+                  normalizedIdentifier
+                )
+            );
+
+          if (patient) {
+            user = db.users.find(
+              u =>
+                u.id === patient.userId
+            );
+          }
+        }
+
+        /* -----------------------------------------------------
+           DOCTOR USER ID / LICENSE
+           ----------------------------------------------------- */
+
+        if (!user) {
+          const doctor =
+            db.doctors.find(
+              d =>
+                d.userId.toLowerCase() ===
+                  normalizedIdentifier ||
+                d.licenseNumber.toLowerCase() ===
+                  normalizedIdentifier
+            );
+
+          if (doctor) {
+            user = db.users.find(
+              u =>
+                u.id === doctor.userId
+            );
+          }
+        }
+      }
+
+      if (!user) {
+        return res.status(401).json({
+          error:
+            'User account not found.'
+        });
+      }
+
+      /* -------------------------------------------------------
+         ROLE VALIDATION
+         ------------------------------------------------------- */
+
+      if (
+        role &&
+        user.role !== role
+      ) {
+        return res.status(403).json({
+          error:
+            'Selected role does not match this account.'
+        });
+      }
+
+      /* -------------------------------------------------------
+         DESTROY OLD SESSION
+         ------------------------------------------------------- */
+
+      const oldToken =
+        getSessionToken(req);
+
+      if (oldToken) {
+        destroySession(oldToken);
+      }
+
+      /* -------------------------------------------------------
+         CREATE NEW SESSION
+         ------------------------------------------------------- */
+
+      const token =
+        createSession(user.id);
+
+      setSessionCookie(
+        res,
+        token
+      );
+
+      return res.json({
+        success: true,
+        user
       });
     }
+  );
 
-    let profile: any = null;
+  /* ===========================================================
+     LOGOUT
+     =========================================================== */
 
-    if (user.role === 'PATIENT') {
-      profile = db.patients.find(
-        p => p.userId === user.id
-      );
-    } else if (user.role === 'DOCTOR') {
-      profile = db.doctors.find(
-        d => d.userId === user.id
-      );
-    } else if (user.role === 'LAB') {
-      profile = db.labs.find(
-        l => l.userId === user.id
-      );
-    } else if (user.role === 'PHARMACY') {
-      profile = db.pharmacies.find(
-        p => p.userId === user.id
-      );
-    }
+  app.post(
+    '/api/auth/logout',
+    (req, res) => {
+      const token =
+        getSessionToken(req);
 
-    res.json({
-      user,
-      profile,
-      allUsers: db.users
-    });
-  });
+      destroySession(token);
 
-  app.post('/api/auth/switch-role', (req, res) => {
-    const { userId } = req.body;
+      clearSessionCookie(res);
 
-    const targetUser = db.users.find(
-      u => u.id === userId
-    );
-
-    if (!targetUser) {
-      return res.status(404).json({
-        error: 'User not found'
+      return res.json({
+        success: true
       });
     }
+  );
 
-    currentUserId = targetUser.id;
+  /* ===========================================================
+     CURRENT USER
+     =========================================================== */
 
-    res.json({
-      success: true,
-      user: targetUser
-    });
-  });
+  app.get(
+    '/api/auth/current-user',
+    (req, res) => {
+      const user =
+        getCurrentUser(req);
 
-  // -------------------------------------------------------------
-  // PATIENT DIRECTORY & UHID SEARCH
-  // -------------------------------------------------------------
+      if (!user) {
+        return res.status(401).json({
+          error:
+            'Not logged in'
+        });
+      }
+
+      let profile: any = null;
+
+      if (
+        user.role === 'PATIENT'
+      ) {
+        profile =
+          db.patients.find(
+            p =>
+              p.userId === user.id
+          );
+      } else if (
+        user.role === 'DOCTOR'
+      ) {
+        profile =
+          db.doctors.find(
+            d =>
+              d.userId === user.id
+          );
+      } else if (
+        user.role === 'LAB'
+      ) {
+        profile =
+          db.labs.find(
+            l =>
+              l.userId === user.id
+          );
+      } else if (
+        user.role === 'PHARMACY'
+      ) {
+        profile =
+          db.pharmacies.find(
+            p =>
+              p.userId === user.id
+          );
+      }
+
+      res.json({
+        user,
+        profile
+      });
+    }
+  );
+
+  /* ===========================================================
+     SWITCH ROLE / ACCOUNT
+     =========================================================== */
+
+  app.post(
+    '/api/auth/switch-role',
+    (req, res) => {
+      const { userId } =
+        req.body;
+
+      const targetUser =
+        db.users.find(
+          u =>
+            u.id === userId
+        );
+
+      if (!targetUser) {
+        return res.status(404).json({
+          error:
+            'User not found'
+        });
+      }
+
+      const oldToken =
+        getSessionToken(req);
+
+      if (oldToken) {
+        destroySession(oldToken);
+      }
+
+      const token =
+        createSession(
+          targetUser.id
+        );
+
+      setSessionCookie(
+        res,
+        token
+      );
+
+      res.json({
+        success: true,
+        user: targetUser
+      });
+    }
+  );
+
+  /* ===========================================================
+     PATIENT DIRECTORY & UHID SEARCH
+     =========================================================== */
 
   app.get(
     '/api/patients/search',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
-      const { uhid } = req.query;
+      const user =
+        (req as any)
+          .currentUser as User;
 
-      if (!uhid || typeof uhid !== 'string') {
+      const { uhid } =
+        req.query;
+
+      if (
+        !uhid ||
+        typeof uhid !== 'string'
+      ) {
         return res.status(400).json({
-          error: 'UHID parameter is required.'
+          error:
+            'UHID parameter is required.'
         });
       }
 
-      const patient = db.patients.find(
-        p =>
-          p.uhid.toLowerCase() ===
-          uhid.toLowerCase().trim()
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.uhid
+              .toLowerCase() ===
+            uhid
+              .toLowerCase()
+              .trim()
+        );
 
       if (!patient) {
         return res.status(404).json({
-          error: `No patient found with UHID: ${uhid}`
+          error:
+            `No patient found with UHID: ${uhid}`
         });
       }
 
-      // ---------------------------------------------------------
-      // CHECK ACTIVE DOCTOR CONSENT
-      // ---------------------------------------------------------
+      let hasActiveConsent =
+        false;
 
-      let hasActiveConsent = false;
-      let activeConsent: PatientConsent | undefined =
+      let activeConsent:
+        | PatientConsent
+        | undefined =
         undefined;
 
-      if (user.role === 'DOCTOR') {
-        const doctorProfile = db.doctors.find(
-          d => d.userId === user.id
-        );
-
-        if (doctorProfile) {
-          activeConsent = db.consents.find(
-            c =>
-              c.patientId === patient.id &&
-              c.doctorId === doctorProfile.id &&
-              c.status === 'APPROVED' &&
-              (!c.expiresAt ||
-                new Date(c.expiresAt) > new Date())
+      if (
+        user.role === 'DOCTOR'
+      ) {
+        const doctorProfile =
+          db.doctors.find(
+            d =>
+              d.userId ===
+              user.id
           );
 
-          hasActiveConsent = !!activeConsent;
+        if (doctorProfile) {
+          activeConsent =
+            db.consents.find(
+              c =>
+                c.patientId ===
+                  patient.id &&
+                c.doctorId ===
+                  doctorProfile.id &&
+                c.status ===
+                  'APPROVED' &&
+                (!c.expiresAt ||
+                  new Date(
+                    c.expiresAt
+                  ) > new Date())
+            );
+
+          hasActiveConsent =
+            !!activeConsent;
         }
       }
 
-      // ---------------------------------------------------------
-      // MASK PATIENT NAME WITHOUT ACTIVE CONSENT
-      // ---------------------------------------------------------
+      const nameParts =
+        patient.fullName.split(
+          ' '
+        );
 
-      const nameParts = patient.fullName.split(' ');
-
-      const maskedName = hasActiveConsent
-        ? patient.fullName
-        : nameParts
-            .map(
-              part =>
-                part.charAt(0) +
-                '*'.repeat(
-                  Math.max(part.length - 1, 2)
-                )
-            )
-            .join(' ');
+      const maskedName =
+        hasActiveConsent
+          ? patient.fullName
+          : nameParts
+              .map(
+                part =>
+                  part.charAt(0) +
+                  '*'.repeat(
+                    Math.max(
+                      part.length - 1,
+                      2
+                    )
+                  )
+              )
+              .join(' ');
 
       logAccess(
         patient.id,
@@ -339,10 +701,6 @@ export async function createApp() {
         req
       );
 
-      // ---------------------------------------------------------
-      // DO NOT RETURN MEDICAL DETAILS HERE
-      // ---------------------------------------------------------
-
       res.json({
         isFound: true,
         uhid: patient.uhid,
@@ -351,42 +709,53 @@ export async function createApp() {
         gender: patient.gender,
         age: patient.age,
         hasActiveConsent,
-        consentStatus: activeConsent
-          ? activeConsent.status
-          : 'NO_CONSENT',
+        consentStatus:
+          activeConsent
+            ? activeConsent.status
+            : 'NO_CONSENT',
         activeConsentId:
-          activeConsent?.id || null,
-        activeScopes: activeConsent
-          ? activeConsent.accessScope
-          : []
+          activeConsent?.id ||
+          null,
+        activeScopes:
+          activeConsent
+            ? activeConsent.accessScope
+            : []
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // PATIENT CONSENT SYSTEM
-  // -------------------------------------------------------------
+  /* ===========================================================
+     PATIENT CONSENT SYSTEM
+     =========================================================== */
 
   app.post(
     '/api/consent/request',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
-      if (user.role !== 'DOCTOR') {
+      if (
+        user.role !== 'DOCTOR'
+      ) {
         return res.status(403).json({
           error:
             'Only verified doctors can request patient record access.'
         });
       }
 
-      const doctor = db.doctors.find(
-        d => d.userId === user.id
-      );
+      const doctor =
+        db.doctors.find(
+          d =>
+            d.userId ===
+            user.id
+        );
 
       if (!doctor) {
         return res.status(404).json({
-          error: 'Doctor profile not found.'
+          error:
+            'Doctor profile not found.'
         });
       }
 
@@ -404,63 +773,128 @@ export async function createApp() {
         duration
       } = req.body;
 
-      const patient = db.patients.find(
-        p => p.uhid === uhid
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.uhid === uhid
+        );
 
       if (!patient) {
         return res.status(404).json({
-          error: 'Patient not found.'
+          error:
+            'Patient not found.'
         });
       }
 
-      const newConsent: PatientConsent = {
-        id: `consent_${Date.now()}_${Math.random()
-          .toString(36)
-          .substring(2, 6)}`,
-        patientId: patient.id,
-        patientName: patient.fullName,
-        uhid: patient.uhid,
-        doctorId: doctor.id,
-        doctorName: doctor.name,
-        doctorSpecialty: doctor.specialization,
-        hospital: doctor.hospital,
-        requestedAt: new Date().toISOString(),
-        status: 'PENDING',
+      const newConsent:
+        PatientConsent = {
+        id:
+          `consent_${Date.now()}_${Math.random()
+            .toString(36)
+            .substring(2, 6)}`,
+
+        patientId:
+          patient.id,
+
+        patientName:
+          patient.fullName,
+
+        uhid:
+          patient.uhid,
+
+        doctorId:
+          doctor.id,
+
+        doctorName:
+          doctor.name,
+
+        doctorSpecialty:
+          doctor.specialization,
+
+        hospital:
+          doctor.hospital,
+
+        requestedAt:
+          new Date().toISOString(),
+
+        status:
+          'PENDING',
+
         accessScope:
-          accessScope && accessScope.length > 0
+          accessScope &&
+          accessScope.length > 0
             ? accessScope
-            : ['BASIC_PROFILE', 'LAB_REPORTS'],
+            : [
+                'BASIC_PROFILE',
+                'LAB_REPORTS'
+              ],
+
         reason:
           reason ||
           'Clinical evaluation and diagnostic review.',
-        duration: duration || '24_HOURS'
+
+        duration:
+          duration ||
+          '24_HOURS'
       };
 
-      db.consents.unshift(newConsent);
+      db.consents.unshift(
+        newConsent
+      );
 
-      // ---------------------------------------------------------
-      // NOTIFY PATIENT
-      // ---------------------------------------------------------
+      const notif:
+        AppNotification = {
+        id:
+          `notif_${Date.now()}`,
 
-      const notif: AppNotification = {
-        id: `notif_${Date.now()}`,
-        recipientUserId: patient.userId,
-        category: 'CONSENT',
-        title: `Access Request: ${doctor.name}`,
-        message: `${doctor.name} (${doctor.specialization} at ${doctor.hospital}) has requested access to your health records. Reason: "${newConsent.reason}".`,
-        scheduledTime: new Date().toISOString(),
-        sentTime: new Date().toISOString(),
-        deliveryStatus: 'DELIVERED',
-        channels: ['IN_APP', 'SMS', 'WHATSAPP'],
-        isRead: false,
+        recipientUserId:
+          patient.userId,
+
+        category:
+          'CONSENT',
+
+        title:
+          `Access Request: ${doctor.name}`,
+
+        message:
+          `${doctor.name} (${doctor.specialization} at ${doctor.hospital}) has requested access to your health records. Reason: "${newConsent.reason}".`,
+
+        scheduledTime:
+          new Date().toISOString(),
+
+        sentTime:
+          new Date().toISOString(),
+
+        deliveryStatus:
+          'DELIVERED',
+
+        channels: [
+          'IN_APP',
+          'SMS',
+          'WHATSAPP'
+        ],
+
+        isRead:
+          false,
+
         metadata: {
-          consentId: newConsent.id,
-          uhid: patient.uhid,
-          doctorId: doctor.id,
-          actionRequired: true,
-          smsPreview: `Health Stack Alert: ${doctor.name} has requested access to your medical records for ${newConsent.reason}. Reply ALLOW or log in to manage.`,
-          whatsappPreview: `🔒 *Consent Authorization Request*
+          consentId:
+            newConsent.id,
+
+          uhid:
+            patient.uhid,
+
+          doctorId:
+            doctor.id,
+
+          actionRequired:
+            true,
+
+          smsPreview:
+            `Health Stack Alert: ${doctor.name} has requested access to your medical records for ${newConsent.reason}. Reply ALLOW or log in to manage.`,
+
+          whatsappPreview:
+            `🔒 *Consent Authorization Request*
 *Doctor*: ${doctor.name}
 *Hospital*: ${doctor.hospital}
 *Reason*: ${newConsent.reason}
@@ -470,7 +904,9 @@ _Review and authorize on Digital Health Stack._`
         }
       };
 
-      db.notifications.unshift(notif);
+      db.notifications.unshift(
+        notif
+      );
 
       logAccess(
         patient.id,
@@ -486,21 +922,25 @@ _Review and authorize on Digital Health Stack._`
 
       res.json({
         success: true,
-        consent: newConsent,
-        message: 'Consent request sent to patient.'
+        consent:
+          newConsent,
+        message:
+          'Consent request sent to patient.'
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // CONSENT RESPONSE
-  // -------------------------------------------------------------
+  /* ===========================================================
+     CONSENT RESPONSE
+     =========================================================== */
 
   app.post(
     '/api/consent/respond',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
       const {
         consentId,
@@ -509,24 +949,34 @@ _Review and authorize on Digital Health Stack._`
         duration
       } = req.body;
 
-      const consent = db.consents.find(
-        c => c.id === consentId
-      );
+      const consent =
+        db.consents.find(
+          c =>
+            c.id ===
+            consentId
+        );
 
       if (!consent) {
         return res.status(404).json({
-          error: 'Consent request not found.'
+          error:
+            'Consent request not found.'
         });
       }
 
-      const patient = db.patients.find(
-        p => p.id === consent.patientId
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.id ===
+            consent.patientId
+        );
 
       if (
         !patient ||
-        (user.role === 'PATIENT' &&
-          patient.userId !== user.id)
+        (
+          user.role === 'PATIENT' &&
+          patient.userId !==
+            user.id
+        )
       ) {
         return res.status(403).json({
           error:
@@ -534,8 +984,12 @@ _Review and authorize on Digital Health Stack._`
         });
       }
 
-      if (decision === 'ALLOW') {
-        consent.status = 'APPROVED';
+      if (
+        decision === 'ALLOW'
+      ) {
+        consent.status =
+          'APPROVED';
+
         consent.approvedAt =
           new Date().toISOString();
 
@@ -543,73 +997,108 @@ _Review and authorize on Digital Health Stack._`
           approvedScopes &&
           approvedScopes.length > 0
         ) {
-          consent.accessScope = approvedScopes;
+          consent.accessScope =
+            approvedScopes;
         }
 
         if (duration) {
-          consent.duration = duration;
+          consent.duration =
+            duration;
         }
 
-        // -------------------------------------------------------
-        // CALCULATE EXPIRATION
-        // -------------------------------------------------------
+        const expDate =
+          new Date();
 
-        const expDate = new Date();
-
-        if (consent.duration === '1_HOUR') {
-          expDate.setHours(
-            expDate.getHours() + 1
-          );
-        } else if (
-          consent.duration === '24_HOURS' ||
-          consent.duration === 'THIS_CONSULTATION'
+        if (
+          consent.duration ===
+          '1_HOUR'
         ) {
           expDate.setHours(
-            expDate.getHours() + 24
+            expDate.getHours() +
+              1
           );
         } else if (
-          consent.duration === '7_DAYS'
+          consent.duration ===
+            '24_HOURS' ||
+          consent.duration ===
+            'THIS_CONSULTATION'
+        ) {
+          expDate.setHours(
+            expDate.getHours() +
+              24
+          );
+        } else if (
+          consent.duration ===
+          '7_DAYS'
         ) {
           expDate.setDate(
-            expDate.getDate() + 7
+            expDate.getDate() +
+              7
           );
         }
 
         consent.expiresAt =
           expDate.toISOString();
 
-        // -------------------------------------------------------
-        // NOTIFY DOCTOR
-        // -------------------------------------------------------
-
-        const doctorProfile = db.doctors.find(
-          d => d.id === consent.doctorId
-        );
+        const doctorProfile =
+          db.doctors.find(
+            d =>
+              d.id ===
+              consent.doctorId
+          );
 
         if (doctorProfile) {
-          const notif: AppNotification = {
-            id: `notif_${Date.now()}`,
-            recipientUserId: doctorProfile.userId,
-            category: 'CONSENT',
-            title: 'Patient Granted Consent',
-            message: `${patient.fullName} (${patient.uhid}) has granted access to records (${consent.accessScope.join(', ')}). Valid until ${expDate.toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit'
-            })}.`,
+          const notif:
+            AppNotification = {
+            id:
+              `notif_${Date.now()}`,
+
+            recipientUserId:
+              doctorProfile.userId,
+
+            category:
+              'CONSENT',
+
+            title:
+              'Patient Granted Consent',
+
+            message:
+              `${patient.fullName} (${patient.uhid}) has granted access to records (${consent.accessScope.join(', ')}). Valid until ${expDate.toLocaleTimeString(
+                [],
+                {
+                  hour: '2-digit',
+                  minute: '2-digit'
+                }
+              )}.`,
+
             scheduledTime:
               new Date().toISOString(),
+
             sentTime:
               new Date().toISOString(),
-            deliveryStatus: 'DELIVERED',
-            channels: ['IN_APP'],
-            isRead: false,
+
+            deliveryStatus:
+              'DELIVERED',
+
+            channels: [
+              'IN_APP'
+            ],
+
+            isRead:
+              false,
+
             metadata: {
-              consentId: consent.id,
-              uhid: patient.uhid
+              consentId:
+                consent.id,
+
+              uhid:
+                patient.uhid
             }
           };
 
-          db.notifications.unshift(notif);
+          db.notifications.unshift(
+            notif
+          );
         }
 
         logAccess(
@@ -631,7 +1120,8 @@ _Review and authorize on Digital Health Stack._`
             'Patient has granted access.'
         });
       } else {
-        consent.status = 'DENIED';
+        consent.status =
+          'DENIED';
 
         logAccess(
           patient.id,
@@ -655,39 +1145,51 @@ _Review and authorize on Digital Health Stack._`
     }
   );
 
-  // -------------------------------------------------------------
-  // CONSENT REVOKE
-  // -------------------------------------------------------------
+  /* ===========================================================
+     CONSENT REVOKE
+     =========================================================== */
 
   app.post(
     '/api/consent/revoke',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
       const {
         consentId,
         reason
       } = req.body;
 
-      const consent = db.consents.find(
-        c => c.id === consentId
-      );
+      const consent =
+        db.consents.find(
+          c =>
+            c.id ===
+            consentId
+        );
 
       if (!consent) {
         return res.status(404).json({
-          error: 'Consent not found.'
+          error:
+            'Consent not found.'
         });
       }
 
-      const patient = db.patients.find(
-        p => p.id === consent.patientId
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.id ===
+            consent.patientId
+        );
 
       if (
         !patient ||
-        (user.role === 'PATIENT' &&
-          patient.userId !== user.id)
+        (
+          user.role === 'PATIENT' &&
+          patient.userId !==
+            user.id
+        )
       ) {
         return res.status(403).json({
           error:
@@ -695,39 +1197,62 @@ _Review and authorize on Digital Health Stack._`
         });
       }
 
-      consent.status = 'REVOKED';
+      consent.status =
+        'REVOKED';
+
       consent.revokedAt =
         new Date().toISOString();
+
       consent.revokedReason =
         reason ||
         'Revoked by patient via consent manager';
 
-      // ---------------------------------------------------------
-      // NOTIFY DOCTOR
-      // ---------------------------------------------------------
-
-      const doctorProfile = db.doctors.find(
-        d => d.id === consent.doctorId
-      );
+      const doctorProfile =
+        db.doctors.find(
+          d =>
+            d.id ===
+            consent.doctorId
+        );
 
       if (doctorProfile) {
         db.notifications.unshift({
-          id: `notif_${Date.now()}`,
+          id:
+            `notif_${Date.now()}`,
+
           recipientUserId:
             doctorProfile.userId,
-          category: 'CONSENT',
-          title: 'Consent Access Revoked',
-          message: `${patient.fullName} (${patient.uhid}) has revoked your clinical data access privileges.`,
+
+          category:
+            'CONSENT',
+
+          title:
+            'Consent Access Revoked',
+
+          message:
+            `${patient.fullName} (${patient.uhid}) has revoked your clinical data access privileges.`,
+
           scheduledTime:
             new Date().toISOString(),
+
           sentTime:
             new Date().toISOString(),
-          deliveryStatus: 'DELIVERED',
-          channels: ['IN_APP'],
-          isRead: false,
+
+          deliveryStatus:
+            'DELIVERED',
+
+          channels: [
+            'IN_APP'
+          ],
+
+          isRead:
+            false,
+
           metadata: {
-            consentId: consent.id,
-            uhid: patient.uhid
+            consentId:
+              consent.id,
+
+            uhid:
+              patient.uhid
           }
         });
       }
@@ -754,61 +1279,83 @@ _Review and authorize on Digital Health Stack._`
     }
   );
 
-  // -------------------------------------------------------------
-  // SENSITIVE CLINICAL RECORD ACCESS
-  // -------------------------------------------------------------
+  /* ===========================================================
+     SENSITIVE CLINICAL RECORD ACCESS
+     =========================================================== */
 
   app.get(
     '/api/patients/records',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
-      const { uhid } = req.query;
+      const user =
+        (req as any)
+          .currentUser as User;
 
-      if (!uhid || typeof uhid !== 'string') {
+      const { uhid } =
+        req.query;
+
+      if (
+        !uhid ||
+        typeof uhid !== 'string'
+      ) {
         return res.status(400).json({
-          error: 'UHID parameter is required.'
+          error:
+            'UHID parameter is required.'
         });
       }
 
-      const patient = db.patients.find(
-        p =>
-          p.uhid.toLowerCase() ===
-          uhid.toLowerCase().trim()
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.uhid
+              .toLowerCase() ===
+            uhid
+              .toLowerCase()
+              .trim()
+        );
 
       if (!patient) {
         return res.status(404).json({
-          error: 'Patient not found.'
+          error:
+            'Patient not found.'
         });
       }
 
-      // ---------------------------------------------------------
-      // CASE 1: PATIENT ACCESSING OWN RECORD
-      // ---------------------------------------------------------
+      /* -------------------------------------------------------
+         CASE 1: PATIENT ACCESSING OWN RECORD
+         ------------------------------------------------------- */
 
       if (
         user.role === 'PATIENT' &&
-        patient.userId === user.id
+        patient.userId ===
+          user.id
       ) {
         const reports =
           db.labReports.filter(
-            r => r.uhid === patient.uhid
+            r =>
+              r.uhid ===
+              patient.uhid
           );
 
         const prescriptions =
           db.prescriptions.filter(
-            p => p.uhid === patient.uhid
+            p =>
+              p.uhid ===
+              patient.uhid
           );
 
         const appointments =
           db.appointments.filter(
-            a => a.uhid === patient.uhid
+            a =>
+              a.uhid ===
+              patient.uhid
           );
 
         const schedules =
           db.medicineSchedules.filter(
-            s => s.patientId === patient.id
+            s =>
+              s.patientId ===
+              patient.id
           );
 
         logAccess(
@@ -825,31 +1372,43 @@ _Review and authorize on Digital Health Stack._`
 
         return res.json({
           patient,
-          labReports: reports,
+          labReports:
+            reports,
           prescriptions,
           appointments,
-          medicineSchedules: schedules,
-          grantedScope: ['FULL_RECORD'],
-          isPatientOwner: true
+          medicineSchedules:
+            schedules,
+          grantedScope:
+            ['FULL_RECORD'],
+          isPatientOwner:
+            true
         });
       }
 
-      // ---------------------------------------------------------
-      // CASE 2: DOCTOR ACCESSING PATIENT RECORD
-      // ---------------------------------------------------------
+      /* -------------------------------------------------------
+         CASE 2: DOCTOR ACCESSING PATIENT RECORD
+         ------------------------------------------------------- */
 
-      if (user.role === 'DOCTOR') {
-        const doctor = db.doctors.find(
-          d => d.userId === user.id
-        );
+      if (
+        user.role === 'DOCTOR'
+      ) {
+        const doctor =
+          db.doctors.find(
+            d =>
+              d.userId ===
+              user.id
+          );
 
         if (!doctor) {
           return res.status(404).json({
-            error: 'Doctor profile not found.'
+            error:
+              'Doctor profile not found.'
           });
         }
 
-        if (!doctor.isVerified) {
+        if (
+          !doctor.isVerified
+        ) {
           logAccess(
             patient.id,
             patient.uhid,
@@ -870,22 +1429,22 @@ _Review and authorize on Digital Health Stack._`
           });
         }
 
-        // -------------------------------------------------------
-        // CHECK ACTIVE CONSENT
-        // -------------------------------------------------------
-
-        const consent = db.consents.find(
-          c =>
-            c.patientId === patient.id &&
-            c.doctorId === doctor.id &&
-            c.status === 'APPROVED' &&
-            (!c.expiresAt ||
-              new Date(c.expiresAt) > new Date())
-        );
-
-        // -------------------------------------------------------
-        // MANDATORY PRIVACY CHECK
-        // -------------------------------------------------------
+        const consent =
+          db.consents.find(
+            c =>
+              c.patientId ===
+                patient.id &&
+              c.doctorId ===
+                doctor.id &&
+              c.status ===
+                'APPROVED' &&
+              (
+                !c.expiresAt ||
+                new Date(
+                  c.expiresAt
+                ) > new Date()
+              )
+          );
 
         if (!consent) {
           logAccess(
@@ -901,82 +1460,120 @@ _Review and authorize on Digital Health Stack._`
           );
 
           return res.status(403).json({
-            error: 'Patient consent required.',
+            error:
+              'Patient consent required.',
             message:
               'A doctor cannot access medical details without explicit, active patient consent.',
-            code: 'CONSENT_REQUIRED',
-            uhid: patient.uhid,
-            patientFound: true
+            code:
+              'CONSENT_REQUIRED',
+            uhid:
+              patient.uhid,
+            patientFound:
+              true
           });
         }
 
-        // -------------------------------------------------------
-        // FILTER DATA BASED ON CONSENT SCOPE
-        // -------------------------------------------------------
-
-        const scopes = consent.accessScope;
+        const scopes =
+          consent.accessScope;
 
         const isFull =
-          scopes.includes('FULL_RECORD');
+          scopes.includes(
+            'FULL_RECORD'
+          );
 
-        const responsePayload: any = {
+        const responsePayload:
+          any = {
           patient: {
-            uhid: patient.uhid,
-            fullName: patient.fullName,
-            age: patient.age,
-            gender: patient.gender,
-            bloodGroup: patient.bloodGroup,
+            uhid:
+              patient.uhid,
+
+            fullName:
+              patient.fullName,
+
+            age:
+              patient.age,
+
+            gender:
+              patient.gender,
+
+            bloodGroup:
+              patient.bloodGroup,
+
             allergies:
               isFull ||
-              scopes.includes('MEDICAL_HISTORY')
+              scopes.includes(
+                'MEDICAL_HISTORY'
+              )
                 ? patient.allergies
                 : [
                     'Access not granted in consent scope'
                   ],
+
             chronicConditions:
               isFull ||
-              scopes.includes('MEDICAL_HISTORY')
+              scopes.includes(
+                'MEDICAL_HISTORY'
+              )
                 ? patient.chronicConditions
                 : [
                     'Access not granted in consent scope'
                   ]
           },
 
-          grantedScope: scopes,
-          consentExpiresAt: consent.expiresAt,
-          consentId: consent.id
+          grantedScope:
+            scopes,
+
+          consentExpiresAt:
+            consent.expiresAt,
+
+          consentId:
+            consent.id
         };
 
         if (
           isFull ||
-          scopes.includes('LAB_REPORTS') ||
-          scopes.includes('DIAGNOSTIC_REPORTS')
+          scopes.includes(
+            'LAB_REPORTS'
+          ) ||
+          scopes.includes(
+            'DIAGNOSTIC_REPORTS'
+          )
         ) {
           responsePayload.labReports =
             db.labReports.filter(
-              r => r.uhid === patient.uhid
+              r =>
+                r.uhid ===
+                patient.uhid
             );
         } else {
-          responsePayload.labReports = [];
+          responsePayload.labReports =
+            [];
         }
 
         if (
           isFull ||
-          scopes.includes('PRESCRIPTIONS')
+          scopes.includes(
+            'PRESCRIPTIONS'
+          )
         ) {
           responsePayload.prescriptions =
             db.prescriptions.filter(
-              p => p.uhid === patient.uhid
+              p =>
+                p.uhid ===
+                patient.uhid
             );
         } else {
-          responsePayload.prescriptions = [];
+          responsePayload.prescriptions =
+            [];
         }
 
         responsePayload.appointments =
           db.appointments.filter(
             a =>
-              a.uhid === patient.uhid &&
-              a.doctorId === doctor.id
+              a.uhid ===
+                patient.uhid &&
+              a.doctorId ===
+                doctor.id
           );
 
         logAccess(
@@ -991,12 +1588,14 @@ _Review and authorize on Digital Health Stack._`
           req
         );
 
-        return res.json(responsePayload);
+        return res.json(
+          responsePayload
+        );
       }
 
-      // ---------------------------------------------------------
-      // CASE 3: ADMIN / PHARMACY / LAB
-      // ---------------------------------------------------------
+      /* -------------------------------------------------------
+         CASE 3: ADMIN / PHARMACY / LAB
+         ------------------------------------------------------- */
 
       if (
         user.role === 'ADMIN' ||
@@ -1016,35 +1615,44 @@ _Review and authorize on Digital Health Stack._`
         );
 
         return res.status(403).json({
-          error: 'Access Denied.',
+          error:
+            'Access Denied.',
           message:
             'Strict RBAC prohibits browsing patient medical history.'
         });
       }
 
       return res.status(403).json({
-        error: 'Patient consent required.'
+        error:
+          'Patient consent required.'
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // DIAGNOSTIC LAB REPORT UPLOAD & OCR
-  // -------------------------------------------------------------
+  /* ===========================================================
+     DIAGNOSTIC LAB REPORT UPLOAD & OCR
+     =========================================================== */
 
   app.post(
     '/api/labs/parse-raw',
     (req, res) => {
-      const { text } = req.body;
+      const { text } =
+        req.body;
 
-      if (!text || typeof text !== 'string') {
+      if (
+        !text ||
+        typeof text !== 'string'
+      ) {
         return res.status(400).json({
-          error: 'Raw report text is required.'
+          error:
+            'Raw report text is required.'
         });
       }
 
       const parsed =
-        parseLaboratoryReport(text);
+        parseLaboratoryReport(
+          text
+        );
 
       return res.json({
         success: true,
@@ -1057,12 +1665,20 @@ _Review and authorize on Digital Health Stack._`
     '/api/labs/upload',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
-      const isLab = user.role === 'LAB';
-      const isPatient = user.role === 'PATIENT';
+      const isLab =
+        user.role === 'LAB';
 
-      if (!isLab && !isPatient) {
+      const isPatient =
+        user.role === 'PATIENT';
+
+      if (
+        !isLab &&
+        !isPatient
+      ) {
         return res.status(403).json({
           error:
             'Only authorized diagnostic centres or patients can upload laboratory reports.'
@@ -1080,27 +1696,37 @@ _Review and authorize on Digital Health Stack._`
         customResults
       } = req.body;
 
-      const patient = db.patients.find(
-        p =>
-          p.uhid.toLowerCase() ===
-          (uhid || '').toLowerCase().trim()
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.uhid
+              .toLowerCase() ===
+            (uhid || '')
+              .toLowerCase()
+              .trim()
+        );
 
       if (!patient) {
         return res.status(404).json({
-          error: `Patient with UHID ${uhid} not found.`
+          error:
+            `Patient with UHID ${uhid} not found.`
         });
       }
 
       if (isPatient) {
-        const patientSelf = db.patients.find(
-          p => p.userId === user.id
-        );
+        const patientSelf =
+          db.patients.find(
+            p =>
+              p.userId ===
+              user.id
+          );
 
         if (
           !patientSelf ||
-          patientSelf.uhid.toLowerCase() !==
-            patient.uhid.toLowerCase()
+          patientSelf.uhid
+            .toLowerCase() !==
+            patient.uhid
+              .toLowerCase()
         ) {
           return res.status(403).json({
             error:
@@ -1117,9 +1743,12 @@ _Review and authorize on Digital Health Stack._`
         'Personal Health Record / Patient Upload';
 
       if (isLab) {
-        const lab = db.labs.find(
-          l => l.userId === user.id
-        );
+        const lab =
+          db.labs.find(
+            l =>
+              l.userId ===
+              user.id
+          );
 
         if (!lab) {
           return res.status(404).json({
@@ -1128,13 +1757,12 @@ _Review and authorize on Digital Health Stack._`
           });
         }
 
-        labId = lab.id;
-        labName = lab.name;
-      }
+        labId =
+          lab.id;
 
-      // ---------------------------------------------------------
-      // PARSE REPORT
-      // ---------------------------------------------------------
+        labName =
+          lab.name;
+      }
 
       const parsed =
         parseLaboratoryReport(
@@ -1143,14 +1771,18 @@ _Review and authorize on Digital Health Stack._`
 
       const finalResults =
         customResults &&
-        Array.isArray(customResults) &&
+        Array.isArray(
+          customResults
+        ) &&
         customResults.length > 0
           ? customResults
           : parsed.testResults;
 
       const hasCritical =
         finalResults.some(
-          (t: any) => t.status === 'Critical'
+          (t: any) =>
+            t.status ===
+            'Critical'
         );
 
       const hasAbnormal =
@@ -1160,70 +1792,118 @@ _Review and authorize on Digital Health Stack._`
             t.status === 'High'
         );
 
-      const computedStatus = hasCritical
-        ? 'Critical Values Detected'
-        : hasAbnormal
-        ? 'Abnormal Values Detected'
-        : 'Normal';
+      const computedStatus =
+        hasCritical
+          ? 'Critical Values Detected'
+          : hasAbnormal
+          ? 'Abnormal Values Detected'
+          : 'Normal';
 
-      const newReport: LabReport = {
-        id: `rep_${Date.now()}_${Math.random()
-          .toString(36)
-          .substring(2, 6)}`,
-        patientId: patient.id,
-        uhid: patient.uhid,
+      const newReport:
+        LabReport = {
+        id:
+          `rep_${Date.now()}_${Math.random()
+            .toString(36)
+            .substring(2, 6)}`,
+
+        patientId:
+          patient.id,
+
+        uhid:
+          patient.uhid,
+
         labId,
+
         labName,
+
         reportName:
-          reportName || parsed.reportName,
+          reportName ||
+          parsed.reportName,
+
         reportType:
-          reportType || parsed.reportType,
+          reportType ||
+          parsed.reportType,
+
         uploadedAt:
           new Date().toISOString(),
+
         fileName:
           fileName ||
           `${(
             reportName ||
             'Diagnostic_Report'
-          ).replace(/\s+/g, '_')}_${patient.uhid}.pdf`,
+          ).replace(
+            /\s+/g,
+            '_'
+          )}_${patient.uhid}.pdf`,
+
         fileSize:
-          fileSize || '420 KB',
+          fileSize ||
+          '420 KB',
+
         ocrRawText:
           ocrRawText || '',
-        testResults: finalResults,
-        statusSummary: computedStatus
+
+        testResults:
+          finalResults,
+
+        statusSummary:
+          computedStatus
       };
 
-      db.labReports.unshift(newReport);
+      db.labReports.unshift(
+        newReport
+      );
 
-      // ---------------------------------------------------------
-      // NOTIFY PATIENT
-      // ---------------------------------------------------------
+      const notif:
+        AppNotification = {
+        id:
+          `notif_${Date.now()}`,
 
-      const notif: AppNotification = {
-        id: `notif_${Date.now()}`,
-        recipientUserId: patient.userId,
-        category: 'LAB_REPORT',
-        title: isPatient
-          ? 'Personal Lab Report Uploaded'
-          : 'New Diagnostic Report Uploaded',
-        message: `${labName} recorded "${newReport.reportName}" to your health profile.`,
+        recipientUserId:
+          patient.userId,
+
+        category:
+          'LAB_REPORT',
+
+        title:
+          isPatient
+            ? 'Personal Lab Report Uploaded'
+            : 'New Diagnostic Report Uploaded',
+
+        message:
+          `${labName} recorded "${newReport.reportName}" to your health profile.`,
+
         scheduledTime:
           new Date().toISOString(),
+
         sentTime:
           new Date().toISOString(),
-        deliveryStatus: 'DELIVERED',
+
+        deliveryStatus:
+          'DELIVERED',
+
         channels: [
           'IN_APP',
           'SMS',
           'WHATSAPP'
         ],
-        isRead: false,
+
+        isRead:
+          false,
+
         metadata: {
-          reportId: newReport.id,
-          uhid: patient.uhid,
-          smsPreview: `Health Stack: New lab report (${newReport.reportName}) recorded by ${labName} for UHID: ${patient.uhid}.`,
-          whatsappPreview: `🔬 *New Laboratory Report Available*
+          reportId:
+            newReport.id,
+
+          uhid:
+            patient.uhid,
+
+          smsPreview:
+            `Health Stack: New lab report (${newReport.reportName}) recorded by ${labName} for UHID: ${patient.uhid}.`,
+
+          whatsappPreview:
+            `🔬 *New Laboratory Report Available*
 *Source*: ${labName}
 *Report*: ${newReport.reportName}
 *Status*: ${newReport.statusSummary}
@@ -1233,7 +1913,9 @@ _View structured results and reference ranges in your health vault._`
         }
       };
 
-      db.notifications.unshift(notif);
+      db.notifications.unshift(
+        notif
+      );
 
       logAccess(
         patient.id,
@@ -1251,36 +1933,46 @@ _View structured results and reference ranges in your health vault._`
 
       res.json({
         success: true,
-        report: newReport,
-        parsedSummary: parsed
+        report:
+          newReport,
+        parsedSummary:
+          parsed
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // PRESCRIPTION & MEDICINE REMINDER GENERATOR
-  // -------------------------------------------------------------
+  /* ===========================================================
+     PRESCRIPTION & MEDICINE REMINDER GENERATOR
+     =========================================================== */
 
   app.post(
     '/api/prescriptions/create',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
-      if (user.role !== 'DOCTOR') {
+      if (
+        user.role !== 'DOCTOR'
+      ) {
         return res.status(403).json({
           error:
             'Only doctors can create prescriptions.'
         });
       }
 
-      const doctor = db.doctors.find(
-        d => d.userId === user.id
-      );
+      const doctor =
+        db.doctors.find(
+          d =>
+            d.userId ===
+            user.id
+        );
 
       if (!doctor) {
         return res.status(404).json({
-          error: 'Doctor not found.'
+          error:
+            'Doctor not found.'
         });
       }
 
@@ -1292,30 +1984,39 @@ _View structured results and reference ranges in your health vault._`
         vitals
       } = req.body;
 
-      const patient = db.patients.find(
-        p =>
-          p.uhid.toLowerCase() ===
-          uhid.toLowerCase().trim()
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.uhid
+              .toLowerCase() ===
+            uhid
+              .toLowerCase()
+              .trim()
+        );
 
       if (!patient) {
         return res.status(404).json({
-          error: 'Patient not found.'
+          error:
+            'Patient not found.'
         });
       }
 
-      // ---------------------------------------------------------
-      // VERIFY ACTIVE CONSENT
-      // ---------------------------------------------------------
-
-      const consent = db.consents.find(
-        c =>
-          c.patientId === patient.id &&
-          c.doctorId === doctor.id &&
-          c.status === 'APPROVED' &&
-          (!c.expiresAt ||
-            new Date(c.expiresAt) > new Date())
-      );
+      const consent =
+        db.consents.find(
+          c =>
+            c.patientId ===
+              patient.id &&
+            c.doctorId ===
+              doctor.id &&
+            c.status ===
+              'APPROVED' &&
+            (
+              !c.expiresAt ||
+              new Date(
+                c.expiresAt
+              ) > new Date()
+            )
+        );
 
       if (!consent) {
         return res.status(403).json({
@@ -1324,65 +2025,106 @@ _View structured results and reference ranges in your health vault._`
         });
       }
 
-      const newPrescription: Prescription = {
-        id: `rx_${Date.now()}_${Math.random()
-          .toString(36)
-          .substring(2, 6)}`,
-        patientId: patient.id,
-        uhid: patient.uhid,
-        patientName: patient.fullName,
-        doctorId: doctor.id,
-        doctorName: doctor.name,
+      const newPrescription:
+        Prescription = {
+        id:
+          `rx_${Date.now()}_${Math.random()
+            .toString(36)
+            .substring(2, 6)}`,
+
+        patientId:
+          patient.id,
+
+        uhid:
+          patient.uhid,
+
+        patientName:
+          patient.fullName,
+
+        doctorId:
+          doctor.id,
+
+        doctorName:
+          doctor.name,
+
         doctorSpecialty:
           doctor.specialization,
-        hospital: doctor.hospital,
+
+        hospital:
+          doctor.hospital,
+
         diagnosis:
-          diagnosis || 'Clinical evaluation',
+          diagnosis ||
+          'Clinical evaluation',
+
         clinicalNotes:
           clinicalNotes || '',
+
         vitals,
-        medicines: medicines || [],
+
+        medicines:
+          medicines || [],
+
         createdAt:
           new Date().toISOString(),
-        pharmacyStatus: 'NEW'
+
+        pharmacyStatus:
+          'NEW'
       };
 
       db.prescriptions.unshift(
         newPrescription
       );
 
-      // ---------------------------------------------------------
-      // GENERATE MEDICINE SCHEDULES
-      // ---------------------------------------------------------
-
       const today =
         new Date()
           .toISOString()
           .split('T')[0];
 
-      const generatedSchedules: MedicineSchedule[] =
-        [];
+      const generatedSchedules:
+        MedicineSchedule[] = [];
 
       for (
-        const med of newPrescription.medicines
+        const med of
+          newPrescription.medicines
       ) {
-        for (const time of med.timings) {
-          const scheduleItem: MedicineSchedule = {
-            id: `sched_${Date.now()}_${Math.random()
-              .toString(36)
-              .substring(2, 6)}`,
+        for (
+          const time of
+            med.timings
+        ) {
+          const scheduleItem:
+            MedicineSchedule = {
+            id:
+              `sched_${Date.now()}_${Math.random()
+                .toString(36)
+                .substring(2, 6)}`,
+
             prescriptionId:
               newPrescription.id,
-            patientId: patient.id,
+
+            patientId:
+              patient.id,
+
             medicineName:
               med.medicineName,
-            dosage: med.dosage,
-            timing: time,
+
+            dosage:
+              med.dosage,
+
+            timing:
+              time,
+
             timingRelation:
               med.timingRelation,
-            date: today,
-            status: 'PENDING',
-            notificationSent: true
+
+            date:
+              today,
+
+            status:
+              'PENDING',
+
+            notificationSent:
+              true
           };
 
           db.medicineSchedules.push(
@@ -1393,35 +2135,51 @@ _View structured results and reference ranges in your health vault._`
             scheduleItem
           );
 
-          // -------------------------------------------------------
-          // MEDICINE NOTIFICATION
-          // -------------------------------------------------------
-
           db.notifications.unshift({
-            id: `notif_med_${Date.now()}_${Math.random()
-              .toString(36)
-              .substring(2, 5)}`,
+            id:
+              `notif_med_${Date.now()}_${Math.random()
+                .toString(36)
+                .substring(2, 5)}`,
+
             recipientUserId:
               patient.userId,
-            category: 'MEDICINE',
-            title: `Medicine Reminder: ${med.medicineName}`,
-            message: `Take ${med.dosage} ${med.timingRelation.toLowerCase()} at ${time}.`,
+
+            category:
+              'MEDICINE',
+
+            title:
+              `Medicine Reminder: ${med.medicineName}`,
+
+            message:
+              `Take ${med.dosage} ${med.timingRelation.toLowerCase()} at ${time}.`,
+
             scheduledTime:
               new Date().toISOString(),
+
             sentTime:
               new Date().toISOString(),
-            deliveryStatus: 'DELIVERED',
+
+            deliveryStatus:
+              'DELIVERED',
+
             channels: [
               'IN_APP',
               'SMS',
               'WHATSAPP'
             ],
-            isRead: false,
+
+            isRead:
+              false,
+
             metadata: {
               prescriptionId:
                 newPrescription.id,
-              smsPreview: `Rx Reminder: ${med.medicineName} (${med.dosage}) - ${med.timingRelation} at ${time}. Digital Health Stack.`,
-              whatsappPreview: `💊 *Prescription Dose Reminder*
+
+              smsPreview:
+                `Rx Reminder: ${med.medicineName} (${med.dosage}) - ${med.timingRelation} at ${time}. Digital Health Stack.`,
+
+              whatsappPreview:
+                `💊 *Prescription Dose Reminder*
 *Medicine*: ${med.medicineName}
 *Dose*: ${med.dosage}
 *Schedule*: ${time} (${med.timingRelation})
@@ -1431,6 +2189,10 @@ _View structured results and reference ranges in your health vault._`
         }
       }
 
+  /* ===========================================================
+     PRESCRIPTION AUDIT / RESPONSE
+     =========================================================== */
+
       logAccess(
         patient.id,
         patient.uhid,
@@ -1438,7 +2200,8 @@ _View structured results and reference ranges in your health vault._`
         'CREATE_PRESCRIPTION',
         `Prescription (${newPrescription.medicines
           .map(
-            (m: any) => m.medicineName
+            (m: any) =>
+              m.medicineName
           )
           .join(', ')})`,
         `Diagnosis: ${diagnosis}`,
@@ -1457,15 +2220,17 @@ _View structured results and reference ranges in your health vault._`
     }
   );
 
-  // -------------------------------------------------------------
-  // APPOINTMENTS - BOOK
-  // -------------------------------------------------------------
+  /* ===========================================================
+     APPOINTMENTS - BOOK
+     =========================================================== */
 
   app.post(
     '/api/appointments/book',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
       const {
         doctorId,
@@ -1475,9 +2240,12 @@ _View structured results and reference ranges in your health vault._`
         isEmergency
       } = req.body;
 
-      const patient = db.patients.find(
-        p => p.userId === user.id
-      );
+      const patient =
+        db.patients.find(
+          p =>
+            p.userId ===
+            user.id
+        );
 
       if (!patient) {
         return res.status(404).json({
@@ -1486,82 +2254,134 @@ _View structured results and reference ranges in your health vault._`
         });
       }
 
-      const doctor = db.doctors.find(
-        d => d.id === doctorId
-      );
+      const doctor =
+        db.doctors.find(
+          d =>
+            d.id ===
+            doctorId
+        );
 
       if (!doctor) {
         return res.status(404).json({
-          error: 'Doctor not found.'
+          error:
+            'Doctor not found.'
         });
       }
 
-      // ---------------------------------------------------------
-      // TOKEN GENERATION
-      // ---------------------------------------------------------
-
       const tokenLetter =
-        isEmergency ? 'E' : 'A';
+        isEmergency
+          ? 'E'
+          : 'A';
 
       const tokenNumber =
         `${tokenLetter}-${Math.floor(
           Math.random() * 30
         ) + 10}`;
 
-      const newApt: Appointment = {
-        id: `apt_${Date.now()}`,
-        patientId: patient.id,
-        patientName: patient.fullName,
-        uhid: patient.uhid,
-        doctorId: doctor.id,
-        doctorName: doctor.name,
+      const newApt:
+        Appointment = {
+        id:
+          `apt_${Date.now()}`,
+
+        patientId:
+          patient.id,
+
+        patientName:
+          patient.fullName,
+
+        uhid:
+          patient.uhid,
+
+        doctorId:
+          doctor.id,
+
+        doctorName:
+          doctor.name,
+
         doctorSpecialty:
           doctor.specialization,
-        hospital: doctor.hospital,
+
+        hospital:
+          doctor.hospital,
+
         consultationFee:
           doctor.consultationFee,
+
         date:
           date ||
           new Date()
             .toISOString()
             .split('T')[0],
+
         time:
-          time || '10:30 AM',
+          time ||
+          '10:30 AM',
+
         tokenNumber,
+
         queuePosition:
-          isEmergency ? 1 : 3,
+          isEmergency
+            ? 1
+            : 3,
+
         estimatedWaitMinutes:
-          isEmergency ? 5 : 35,
-        isEmergency: !!isEmergency,
-        status: 'PENDING',
+          isEmergency
+            ? 5
+            : 35,
+
+        isEmergency:
+          !!isEmergency,
+
+        status:
+          'PENDING',
+
         reasonForVisit:
           reasonForVisit ||
           'General Consultation'
       };
 
-      db.appointments.unshift(newApt);
-
-      // ---------------------------------------------------------
-      // NOTIFY DOCTOR
-      // ---------------------------------------------------------
+      db.appointments.unshift(
+        newApt
+      );
 
       db.notifications.unshift({
-        id: `notif_${Date.now()}`,
-        recipientUserId: doctor.userId,
-        category: 'APPOINTMENT',
+        id:
+          `notif_${Date.now()}`,
+
+        recipientUserId:
+          doctor.userId,
+
+        category:
+          'APPOINTMENT',
+
         title:
           'New Appointment Booking Request',
-        message: `${patient.fullName} (${patient.uhid}) requested an appointment for ${newApt.date} at ${newApt.time}. Reason: ${newApt.reasonForVisit}.`,
+
+        message:
+          `${patient.fullName} (${patient.uhid}) requested an appointment for ${newApt.date} at ${newApt.time}. Reason: ${newApt.reasonForVisit}.`,
+
         scheduledTime:
           new Date().toISOString(),
+
         sentTime:
           new Date().toISOString(),
-        deliveryStatus: 'DELIVERED',
-        channels: ['IN_APP'],
-        isRead: false,
+
+        deliveryStatus:
+          'DELIVERED',
+
+        channels: [
+          'IN_APP'
+        ],
+
+        isRead:
+          false,
+
         metadata: {
-          appointmentId: newApt.id,
-          uhid: patient.uhid
+          appointmentId:
+            newApt.id,
+
+          uhid:
+            patient.uhid
         }
       });
 
@@ -1579,73 +2399,104 @@ _View structured results and reference ranges in your health vault._`
 
       res.json({
         success: true,
-        appointment: newApt
+        appointment:
+          newApt
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // APPOINTMENTS - UPDATE STATUS
-  // -------------------------------------------------------------
+  /* ===========================================================
+     APPOINTMENTS - UPDATE STATUS
+     =========================================================== */
 
   app.post(
     '/api/appointments/update-status',
     authMiddleware,
     (req, res) => {
-      const user = (req as any).currentUser as User;
+      const user =
+        (req as any)
+          .currentUser as User;
 
       const {
         appointmentId,
         status
       } = req.body;
 
-      const apt = db.appointments.find(
-        a => a.id === appointmentId
-      );
+      const apt =
+        db.appointments.find(
+          a =>
+            a.id ===
+            appointmentId
+        );
 
       if (!apt) {
         return res.status(404).json({
-          error: 'Appointment not found.'
+          error:
+            'Appointment not found.'
         });
       }
 
-      apt.status = status;
+      apt.status =
+        status;
 
-      if (status === 'CONFIRMED') {
+      if (
+        status ===
+        'CONFIRMED'
+      ) {
         apt.confirmedAt =
           new Date().toISOString();
 
-        // -------------------------------------------------------
-        // NOTIFY PATIENT
-        // -------------------------------------------------------
-
-        const patient = db.patients.find(
-          p => p.id === apt.patientId
-        );
+        const patient =
+          db.patients.find(
+            p =>
+              p.id ===
+              apt.patientId
+          );
 
         if (patient) {
           db.notifications.unshift({
-            id: `notif_${Date.now()}`,
+            id:
+              `notif_${Date.now()}`,
+
             recipientUserId:
               patient.userId,
-            category: 'APPOINTMENT',
-            title: `Appointment Confirmed with ${apt.doctorName}`,
-            message: `Your appointment is confirmed for ${apt.date} at ${apt.time} (${apt.doctorSpecialty}, ${apt.hospital}). Token: ${apt.tokenNumber}. Please arrive 10 minutes early.`,
+
+            category:
+              'APPOINTMENT',
+
+            title:
+              `Appointment Confirmed with ${apt.doctorName}`,
+
+            message:
+              `Your appointment is confirmed for ${apt.date} at ${apt.time} (${apt.doctorSpecialty}, ${apt.hospital}). Token: ${apt.tokenNumber}. Please arrive 10 minutes early.`,
+
             scheduledTime:
               new Date().toISOString(),
+
             sentTime:
               new Date().toISOString(),
-            deliveryStatus: 'DELIVERED',
+
+            deliveryStatus:
+              'DELIVERED',
+
             channels: [
               'IN_APP',
               'SMS',
               'WHATSAPP'
             ],
-            isRead: false,
+
+            isRead:
+              false,
+
             metadata: {
-              appointmentId: apt.id,
-              smsPreview: `Appt Confirmed: ${apt.doctorName} (${apt.doctorSpecialty}) on ${apt.date}, ${apt.time}. Token: ${apt.tokenNumber}. Arrive 10m early. Digital Health Stack.`,
-              whatsappPreview: `🗓️ *Appointment Confirmation*
+              appointmentId:
+                apt.id,
+
+              smsPreview:
+                `Appt Confirmed: ${apt.doctorName} (${apt.doctorSpecialty}) on ${apt.date}, ${apt.time}. Token: ${apt.tokenNumber}. Arrive 10m early. Digital Health Stack.`,
+
+              whatsappPreview:
+                `🗓️ *Appointment Confirmation*
 *Doctor*: ${apt.doctorName}
 *Specialty*: ${apt.doctorSpecialty}
 *Token*: ${apt.tokenNumber}
@@ -1658,26 +2509,32 @@ _View structured results and reference ranges in your health vault._`
 
       res.json({
         success: true,
-        appointment: apt
+        appointment:
+          apt
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // AUDIT LOGS
-  // -------------------------------------------------------------
+  /* ===========================================================
+     AUDIT LOGS
+     =========================================================== */
 
   app.get(
     '/api/audit-logs',
     authMiddleware,
     (req, res) => {
       const user =
-        (req as any).currentUser as User;
+        (req as any)
+          .currentUser as User;
 
-      if (user.role === 'PATIENT') {
+      if (
+        user.role === 'PATIENT'
+      ) {
         const patient =
           db.patients.find(
-            p => p.userId === user.id
+            p =>
+              p.userId ===
+              user.id
           );
 
         if (!patient) {
@@ -1690,34 +2547,37 @@ _View structured results and reference ranges in your health vault._`
         const patientLogs =
           db.accessLogs.filter(
             l =>
-              l.patientId === patient.id ||
-              l.patientUhid === patient.uhid
+              l.patientId ===
+                patient.id ||
+              l.patientUhid ===
+                patient.uhid
           );
 
         return res.json({
-          logs: patientLogs
+          logs:
+            patientLogs
         });
       }
 
-      if (user.role === 'ADMIN') {
+      if (
+        user.role === 'ADMIN'
+      ) {
         return res.json({
-          logs: db.accessLogs
+          logs:
+            db.accessLogs
         });
       }
 
       return res.status(403).json({
-        error: 'Access denied.'
+        error:
+          'Access denied.'
       });
     }
   );
 
-  // -------------------------------------------------------------
-  // FULL DATABASE SYNC
-  // -------------------------------------------------------------
-  //
-  // IMPORTANT:
-  // This endpoint is now protected by authMiddleware.
-  // -------------------------------------------------------------
+  /* ===========================================================
+     FULL DATABASE SYNC
+     =========================================================== */
 
   app.get(
     '/api/sync',
@@ -1730,23 +2590,30 @@ _View structured results and reference ranges in your health vault._`
   return app;
 }
 
-// -------------------------------------------------------------
-// START SERVER
-// -------------------------------------------------------------
+/* =============================================================
+   START SERVER
+   ============================================================= */
 
 async function startServer() {
-  const app = await createApp();
+  const app =
+    await createApp();
 
   const PORT =
-    Number(process.env.PORT) || 3000;
+    Number(process.env.PORT) ||
+    3000;
 
-  // -------------------------------------------------------------
-  // LOAD APPLICATION STATE FROM POSTGRESQL
-  // -------------------------------------------------------------
+  /* ===========================================================
+     LOAD APPLICATION STATE FROM POSTGRESQL
+     =========================================================== */
 
-  if (process.env.DATABASE_URL) {
+  if (
+    process.env.DATABASE_URL
+  ) {
     try {
-      db = await loadAppState(db);
+      db =
+        await loadAppState(
+          db
+        );
 
       console.log(
         'Application state loaded from PostgreSQL.'
@@ -1758,6 +2625,7 @@ async function startServer() {
       );
 
       process.exitCode = 1;
+
       return;
     }
   } else {
@@ -1766,11 +2634,13 @@ async function startServer() {
     );
   }
 
-  // -------------------------------------------------------------
-  // TEST POSTGRESQL CONNECTION
-  // -------------------------------------------------------------
+  /* ===========================================================
+     TEST POSTGRESQL CONNECTION
+     =========================================================== */
 
-  if (process.env.DATABASE_URL) {
+  if (
+    process.env.DATABASE_URL
+  ) {
     try {
       await testDatabaseConnection();
 
@@ -1784,51 +2654,63 @@ async function startServer() {
       );
 
       process.exitCode = 1;
+
       return;
     }
   }
 
-  // -------------------------------------------------------------
-  // VITE DEVELOPMENT SERVER
-  // -------------------------------------------------------------
+  /* ===========================================================
+     VITE DEVELOPMENT SERVER
+     =========================================================== */
 
   if (
-    process.env.NODE_ENV !== 'production'
+    process.env.NODE_ENV !==
+    'production'
   ) {
     const vite =
       await createViteServer({
         server: {
-          middlewareMode: true
+          middlewareMode:
+            true
         },
-        appType: 'spa'
+        appType:
+          'spa'
       });
 
-    app.use(vite.middlewares);
+    app.use(
+      vite.middlewares
+    );
   } else {
-    // -----------------------------------------------------------
-    // PRODUCTION STATIC FILES
-    // -----------------------------------------------------------
+    /* =========================================================
+       PRODUCTION STATIC FILES
+       ========================================================= */
 
     app.use(
       express.static(
-        path.join(__dirname, 'dist')
+        path.join(
+          __dirname,
+          'dist'
+        )
       )
     );
 
-    app.get('*', (_req, res) => {
-      res.sendFile(
-        path.join(
-          __dirname,
-          'dist',
-          'index.html'
-        )
-      );
-    });
+    app.get(
+      '*',
+      (_req, res) => {
+        res.sendFile(
+          path.join(
+            __dirname,
+            'dist',
+            'index.html'
+          )
+        );
+      }
+    );
   }
 
-  // -------------------------------------------------------------
-  // START HTTP SERVER
-  // -------------------------------------------------------------
+  /* ===========================================================
+     START HTTP SERVER
+     =========================================================== */
 
   app.listen(
     PORT,
@@ -1841,12 +2723,13 @@ async function startServer() {
   );
 }
 
-// -------------------------------------------------------------
-// START SERVER IF EXECUTED DIRECTLY
-// -------------------------------------------------------------
+/* =============================================================
+   START SERVER IF EXECUTED DIRECTLY
+   ============================================================= */
 
 if (
-  process.env.NODE_ENV !== 'test'
+  process.env.NODE_ENV !==
+  'test'
 ) {
   startServer();
 }
